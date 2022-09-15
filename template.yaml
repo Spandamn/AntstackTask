@@ -1,0 +1,482 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  sam-task-test
+
+  Template for the student data management application.
+
+# Globals: For all functions, this data will be used
+Globals:
+  Function:
+    Runtime: nodejs16.x
+    CodeUri: src/
+    Environment:
+      Variables:
+        detailTable: !Ref StudentDeets
+        academicTable: !Ref StudentAcademics
+        attendanceTable: !Ref StudentAttendance
+  HttpApi:
+    AccessLogSettings:
+      DestinationArn: !GetAtt StudentAppLogGroup.Arn
+      Format: "$context.requestId $context.error.message $context.integrationErrorMessage"
+
+Resources:
+  # S3 bucket for student data
+  StudentDataBucket:
+    Type: AWS::S3::Bucket
+
+
+  # Log Group for the Application
+  StudentAppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties: 
+      LogGroupName: StudentAppLogGroup
+
+  # Roles: Roles required for the execution of each resource.
+  StateMachineRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub states.${AWS::Region}.amazonaws.com
+            Action: "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "lambda:InvokeFunction"
+                  - "dynamodb:*"
+                  - "cloudwatch:*"
+                  - "logs:*"
+                Resource: "*"
+
+  ApiInvokeSFnRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub apigateway.amazonaws.com
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: SFnInvocationPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - "lambda:*"
+                  - "states:*"
+                  - "cloudwatch:*"
+                  - "logs:*"
+                Resource: "*"
+
+  S3FileUploadRole:
+    Type: AWS::IAM::Role
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/AmazonS3FullAccess'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - 'lambda.amazonaws.com'
+                - 'apigateway.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+
+  LambdaInvokePermS3:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt CreateJsonEntry.Arn
+      Action: 'lambda:*'
+      Principal: 's3.amazonaws.com'
+      SourceAccount: !Sub ${AWS::AccountId}
+      SourceArn: !GetAtt StudentDataBucket.Arn
+      
+  LambdaInvokePermLambda:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt CreateEntry.Arn
+      Action: 'lambda:*'
+      Principal: 'lambda.amazonaws.com'
+      SourceAccount: !Sub ${AWS::AccountId}
+      SourceArn: !GetAtt CreateJsonEntry.Arn
+  
+  # APIs.
+  # Upload to S3 API
+  S3FileUploadApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: prod
+      DefinitionBody: 
+        info:
+          description: "API to upload files to S3"
+          version: "1.0"
+          title: "S3 File Upload API"
+        host: "${!Ref S3FileUploadApi}.execute-api.us-east-1.amazonaws.com"
+        schemes:
+        - "https"
+        paths:
+          /student/{filename}:
+            put:
+              parameters:
+              - name: "filename"
+                in: "path"
+                required: true
+                type: "string"
+              responses: {}
+              x-amazon-apigateway-integration:
+                credentials: !GetAtt S3FileUploadRole.Arn
+                httpMethod: "PUT"
+                uri: "arn:aws:apigateway:us-east-1:s3:path/sam-task-test-studentdatabucket-p37jkty5v5zx/{key}"
+                responses:
+                  default:
+                    statusCode: "200"
+                requestParameters:
+                  integration.request.path.key: "method.request.path.filename"
+                passthroughBehavior: "when_no_match"
+                payloadFormatVersion: "2.0"
+                type: 'aws'
+                connectionType: INTERNET
+        x-amazon-apigateway-binary-media-types:
+        - "application/json"
+        openapi: 3.0.1
+        x-amazon-apigateway-cors:
+          allowMethods:
+            - "POST"
+            - "DELETE"
+            - "GET"
+          allowHeaders:
+            - content-type
+          allowOrigins:
+            - '*'
+
+  # CRUD API
+  CRUDStudentDataAPI:
+    Type: AWS::Serverless::HttpApi
+    Properties: 
+      FailOnWarnings: True
+      DefinitionBody:
+        info:
+          version: 1.0
+          title: CreateStudentDataAPI
+        paths:
+          "/student":
+            post:
+              responses:
+                default: 
+                  description: "This is the default POST response"
+              x-amazon-apigateway-integration:
+                integrationSubtype: "StepFunctions-StartSyncExecution"
+                credentials: !GetAtt ApiInvokeSFnRole.Arn
+                requestParameters:
+                  Input: "$request.body"
+                  StateMachineArn: !Ref CreateDataStateMachine
+                payloadFormatVersion: "1.0"
+                type: 'aws_proxy'
+                connectionType: INTERNET
+            delete:
+              responses:
+                default: 
+                  description: "This is the default DELETE response"
+              x-amazon-apigateway-integration:
+                uri: !GetAtt DeleteEntry.Arn
+                httpMethod: DELETE
+                credentials: !GetAtt ApiInvokeSFnRole.Arn
+                payloadFormatVersion: "2.0"
+                type: 'aws_proxy'
+                connectionType: INTERNET
+            get:
+              responses:
+                default: 
+                  description: "This is the default GET response"
+              x-amazon-apigateway-integration:
+                uri: !GetAtt GetEntry.Arn
+                httpMethod: GET
+                credentials: !GetAtt ApiInvokeSFnRole.Arn
+                payloadFormatVersion: "2.0"
+                type: 'aws_proxy'
+                connectionType: INTERNET
+        openapi: 3.0.1
+        x-amazon-apigateway-cors:
+          allowMethods:
+            - "POST"
+            - "DELETE"
+            - "GET"
+          allowHeaders:
+            - content-type
+          allowOrigins:
+            - '*'
+  # TBD
+  # NotifyParentApi:
+  #   Type: AWS::Serverless::HttpApi
+  #   Properties: 
+  #     FailOnWarnings: True
+  #     DefinitionBody:
+  #       info:
+  #         version: 1.0
+  #         title: CreateStudentDataAPI
+  #       paths:
+  #         "/notify/class/${className}":
+  #           post:
+  #             responses:
+  #               default: 
+  #                 description: "This is the default POST response"
+  #             x-amazon-apigateway-integration:
+  #               integrationSubtype: "StepFunctions-StartSyncExecution"
+  #               credentials: !GetAtt ApiInvokeSFnRole.Arn
+  #               requestParameters:
+  #                 Input: "method.request.path.className"
+  #                 StateMachineArn: !Ref NotifyStateMachine
+  #               payloadFormatVersion: "1.0"
+  #               type: 'aws_proxy'
+  #               connectionType: INTERNET
+  #         "/notify/student/${studentid}":
+  #           post:
+  #             responses:
+  #               default: 
+  #                 description: "This is the default POST response"
+  #             x-amazon-apigateway-integration:
+  #               integrationSubtype: "StepFunctions-StartSyncExecution"
+  #               credentials: !GetAtt ApiInvokeSFnRole.Arn
+  #               requestParameters:
+  #                 Input: "method.request.path.studentid"
+  #                 StateMachineArn: !Ref NotifyStateMachine
+  #               payloadFormatVersion: "1.0"
+  #               type: 'aws_proxy'
+  #               connectionType: INTERNET
+  #       openapi: 3.0.1
+  #       x-amazon-apigateway-cors:
+  #         allowMethods:
+  #           - "POST"
+  #         allowOrigins:
+  #           - '*'
+  
+  # Lambda Functions
+  # S3 trigger function for json files
+  CreateJsonEntry: 
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: createJsonEntry.handler
+      Policies: 
+       - AmazonS3FullAccess
+       - AWSLambda_FullAccess
+       - AmazonDynamoDBFullAccess
+      Environment:
+        Variables:
+          createEntry: !Ref CreateEntry
+      Events: 
+        TriggeredbyS3:
+          Type: S3
+          Properties:
+            Bucket: !Ref StudentDataBucket
+            Events: s3:ObjectCreated:*
+
+  # Lambda to create the entry for the student.
+  CreateEntry:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: createEntry.handler
+      Policies: 
+        - AmazonDynamoDBFullAccess
+        - AWSLambdaExecute
+        - AWSLambdaBasicExecutionRole
+
+  # Lambda to delete the entry for the student
+  DeleteEntry:
+    Type: AWS::Serverless::Function
+    Properties: 
+      Handler: deleteEntry.handler
+      Policies: 
+        - AmazonDynamoDBFullAccess
+        - AWSLambdaExecute
+        - AWSLambdaBasicExecutionRole
+
+  # Lambda to fetch the entry for the student - this function will also be invoked while generating report
+  GetEntry:
+    Type: AWS::Serverless::Function
+    Properties: 
+      Handler: getEntry.handler
+      Policies: 
+        - AmazonDynamoDBFullAccess
+        - AWSLambdaExecute
+        - AWSLambdaBasicExecutionRole
+
+  # Lambda to generate PDF report of the student
+  CreateStudentReport: 
+    Type: AWS::Serverless::Function
+    Properties: 
+      Timeout: 6
+      Handler: createReport.handler
+      Policies: 
+        - AmazonDynamoDBFullAccess
+        - AWSLambdaExecute
+        - AWSLambdaBasicExecutionRole
+
+  # 3 databases are created; one for the student details, second for student marks and third for student attendance
+  StudentDeets:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: StudentDeets
+      AttributeDefinitions: 
+      - AttributeName: studentid
+        AttributeType: S
+      KeySchema:
+      - AttributeName: studentid
+        KeyType: HASH
+
+  StudentAcademics:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: StudentAcademics
+      AttributeDefinitions: 
+      - AttributeName: studentid
+        AttributeType: S
+      - AttributeName: assesment
+        AttributeType: S
+      KeySchema:
+      - AttributeName: studentid
+        KeyType: HASH
+      - AttributeName: assesment
+        KeyType: RANGE
+
+  StudentAttendance:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      ProvisionedThroughput:
+        ReadCapacityUnits: 1
+        WriteCapacityUnits: 1
+      TableName: StudentAttendance
+      AttributeDefinitions: 
+      - AttributeName: studentid
+        AttributeType: S
+      - AttributeName: month
+        AttributeType: S
+      KeySchema:
+      - AttributeName: studentid
+        KeyType: HASH
+      - AttributeName: month
+        KeyType: RANGE
+
+  # Step Functions
+  # State Machine for data creation
+  CreateDataStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties: 
+      Name: CreateDataStateMachine
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup: 
+              LogGroupArn: !GetAtt StudentAppLogGroup.Arn
+        Level: ALL
+      Definition: 
+        Comment: State machine of the application
+        StartAt: Lambda Invoke
+        States:
+          Lambda Invoke:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            OutputPath: "$.Payload"
+            Parameters:
+              Payload.$: "$"
+              FunctionName: !GetAtt CreateEntry.Arn
+            Retry:
+            - ErrorEquals:
+
+              - Lambda.ServiceException
+              - Lambda.AWSLambdaException
+              - Lambda.SdkClientException
+              IntervalSeconds: 2
+              MaxAttempts: 6
+              BackoffRate: 2
+            Next: DynamoDB PutItem
+          DynamoDB PutItem:
+            Type: Task
+            Resource: arn:aws:states:::dynamodb:putItem
+            Parameters:
+              TableName: !Ref StudentDeets
+              Item.$: "$"
+            End: true
+      Type: EXPRESS
+      Role: !GetAtt StateMachineRole.Arn
+
+  # State Machine for report creation
+  GetReport:
+    Type: AWS::Serverless::StateMachine
+    Properties: 
+      Name: GetReport
+      Logging:
+        Destinations:
+          - CloudWatchLogsLogGroup: 
+              LogGroupArn: !GetAtt StudentAppLogGroup.Arn
+        Level: ALL
+      Definition: 
+        Comment: State machine of the application
+        StartAt: Get Entry
+        States:
+          Get Entry:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            OutputPath: "$.Payload"
+            Parameters:
+              Payload.$: "$"
+              FunctionName: !GetAtt GetEntry.Arn
+            Retry:
+            - ErrorEquals:
+
+              - Lambda.ServiceException
+              - Lambda.AWSLambdaException
+              - Lambda.SdkClientException
+              IntervalSeconds: 2
+              MaxAttempts: 6
+              BackoffRate: 2
+            Next: Create Report
+          Create Report:
+            Type: Task
+            Resource: arn:aws:states:::lambda:invoke
+            OutputPath: "$.Payload"
+            Parameters:
+              Payload.$: "$"
+              FunctionName: !GetAtt CreateStudentReport.Arn
+            Retry:
+            - ErrorEquals:
+              - Lambda.ServiceException
+              - Lambda.AWSLambdaException
+              - Lambda.SdkClientException
+              IntervalSeconds: 2
+              MaxAttempts: 6
+              BackoffRate: 2
+            End: true
+      Type: EXPRESS
+      Role: !GetAtt StateMachineRole.Arn
+      
+  # NotifyStateMachine:
+  #   Type: AWS::Serverless::StateMachine
+  #   Properties: 
+  #     Name: NotifyStateMachine
+  #     Logging:
+  #       Destinations:
+  #         - CloudWatchLogsLogGroup: 
+  #             LogGroupArn: !GetAtt StudentAppLogGroup.Arn
+  #       Level: ALL
